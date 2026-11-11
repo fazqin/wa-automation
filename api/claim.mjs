@@ -23,7 +23,7 @@ export default async function handler(req, res) {
             const hadiah = dataHadiah[0];
             const claimedDevices = Array.isArray(hadiah.claimed_devices) ? hadiah.claimed_devices : [];
 
-            // A. Cek apakah perangkat ini sudah pernah mengklaim sebelumnya
+            // A. Cek jika perangkat ini sudah pernah klaim sebelumnya
             if (claimedDevices.includes(visitorId)) {
                 return res.status(200).json({
                     success: true,
@@ -34,7 +34,7 @@ export default async function handler(req, res) {
                 });
             }
 
-            // B. Cek apakah kuota untuk orang tercepat sudah habis
+            // B. Cek jika kuota orang tercepat sudah habis
             if (claimedDevices.length >= hadiah.max_views) {
                 return res.status(403).json({
                     success: false,
@@ -42,7 +42,7 @@ export default async function handler(req, res) {
                 });
             }
 
-            // C. Perangkat baru & kuota masih ada: Daftarkan device ID
+            // C. Perangkat baru & kuota masih tersedia
             const updatedDevices = [...claimedDevices, visitorId];
             const newCount = updatedDevices.length;
 
@@ -69,10 +69,8 @@ export default async function handler(req, res) {
     }
 
     // -------------------------------------------------------------
-    // 2. HANDLER GET: Halaman Klien + FingerprintJS Loader
+    // 2. HANDLER GET: Halaman Klien
     // -------------------------------------------------------------
-    const { id } = req.query;
-
     res.setHeader('Content-Type', 'text/html');
     return res.status(200).send(`
 <!DOCTYPE html>
@@ -100,9 +98,30 @@ export default async function handler(req, res) {
         <p style="color: #64748b; font-size: 14px;">Memeriksa kuota dan validasi perangkat Anda.</p>
     </div>
 
-    <!-- FingerprintJS Open Source CDN -->
-    <script src="https://openfpcdn.io/fingerprintjs/v4"></script>
     <script>
+        // Fallback jika CDN diblokir AdBlock atau koneksi gagal
+        function getFallbackId() {
+            let localId = localStorage.getItem('device_claim_id');
+            if (!localId) {
+                localId = 'dev_' + Math.random().toString(36).substring(2) + Date.now().toString(36);
+                localStorage.setItem('device_claim_id', localId);
+            }
+            return localId;
+        }
+
+        async function getDeviceFingerprint() {
+            try {
+                // Memuat modul via dynamic import (bebas SyntaxError 'export')
+                const FingerprintJS = await import('https://openfpcdn.io/fingerprintjs/v4');
+                const fp = await FingerprintJS.load();
+                const result = await fp.get();
+                return result.visitorId;
+            } catch (err) {
+                console.warn('Gagal memuat FingerprintJS, beralih ke fallback ID:', err);
+                return getFallbackId();
+            }
+        }
+
         async function runClaim() {
             const container = document.getElementById('app');
             const urlParams = new URLSearchParams(window.location.search);
@@ -114,17 +133,22 @@ export default async function handler(req, res) {
             }
 
             try {
-                // Inisialisasi FingerprintJS
-                const fp = await FingerprintJS.load();
-                const result = await fp.get();
-                const visitorId = result.visitorId;
+                // 1. Ambil ID unik perangkat
+                const visitorId = await getDeviceFingerprint();
 
-                // Kirim ID hadiah dan visitorId perangkat ke server
+                // 2. Kirim ke API Vercel
                 const response = await fetch('/api/claim', {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify({ id: idHadiah, visitorId: visitorId })
                 });
+
+                if (!response.ok) {
+                    const errorText = await response.text();
+                    console.error('Server error:', errorText);
+                    container.innerHTML = '<h3 class="error-msg">❌ Terjadi Masalah pada Server</h3><p style="color:#64748b;font-size:13px;">Gagal memproses klaim di database.</p>';
+                    return;
+                }
 
                 const data = await response.json();
 
@@ -136,7 +160,6 @@ export default async function handler(req, res) {
                     return;
                 }
 
-                // Tampilan jika klaim berhasil atau perangkat sudah pernah klaim
                 const badgeHtml = data.isRevisit 
                     ? '<span class="badge badge-warning">Perangkat ini sudah pernah klaim</span>'
                     : '<span class="badge badge-success">🎉 Klaim Berhasil!</span>';
@@ -150,8 +173,8 @@ export default async function handler(req, res) {
                 \`;
 
             } catch (err) {
+                console.error('Fatal client error:', err);
                 container.innerHTML = '<h3 class="error-msg">Terjadi kesalahan koneksi saat verifikasi.</h3>';
-                console.error(err);
             }
         }
 
