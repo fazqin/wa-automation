@@ -1,17 +1,25 @@
 import { neon } from '@neondatabase/serverless';
+import crypto from 'crypto';
 
 export default async function handler(req, res) {
     const sql = neon(process.env.DATABASE_URL);
 
     // -------------------------------------------------------------
-    // 1. HANDLER POST: Validasi Fingerprint Device & Ambil Hadiah
+    // 1. HANDLER POST: Validasi Cross-Browser Signature
     // -------------------------------------------------------------
     if (req.method === 'POST') {
-        const { id, visitorId } = req.body;
+        const { id, hardware } = req.body;
 
-        if (!id || !visitorId) {
+        if (!id || !hardware) {
             return res.status(400).json({ success: false, message: 'Data request tidak lengkap.' });
         }
+
+        // Ambil Public IP pengguna dari header Vercel
+        const clientIp = (req.headers['x-forwarded-for'] || req.socket.remoteAddress || '').split(',')[0].trim();
+
+        // Buat Device Signature unik: Gabungan IP + GPU + Resolusi Layar + CPU Cores
+        const rawSignature = `${clientIp}_${hardware.gpu}_${hardware.screen}_${hardware.cores}`;
+        const deviceId = crypto.createHash('sha256').update(rawSignature).digest('hex');
 
         try {
             const dataHadiah = await sql`SELECT * FROM klaim_hadiah WHERE id_hadiah = ${id}`;
@@ -23,8 +31,8 @@ export default async function handler(req, res) {
             const hadiah = dataHadiah[0];
             const claimedDevices = Array.isArray(hadiah.claimed_devices) ? hadiah.claimed_devices : [];
 
-            // A. Cek jika perangkat ini sudah pernah klaim sebelumnya
-            if (claimedDevices.includes(visitorId)) {
+            // A. Cek apakah device signature ini sudah pernah klaim
+            if (claimedDevices.includes(deviceId)) {
                 return res.status(200).json({
                     success: true,
                     isRevisit: true,
@@ -34,7 +42,7 @@ export default async function handler(req, res) {
                 });
             }
 
-            // B. Cek jika kuota orang tercepat sudah habis
+            // B. Cek apakah kuota sudah habis
             if (claimedDevices.length >= hadiah.max_views) {
                 return res.status(403).json({
                     success: false,
@@ -42,8 +50,8 @@ export default async function handler(req, res) {
                 });
             }
 
-            // C. Perangkat baru & kuota masih tersedia
-            const updatedDevices = [...claimedDevices, visitorId];
+            // C. Perangkat baru & kuota masih ada
+            const updatedDevices = [...claimedDevices, deviceId];
             const newCount = updatedDevices.length;
 
             await sql`
@@ -69,7 +77,7 @@ export default async function handler(req, res) {
     }
 
     // -------------------------------------------------------------
-    // 2. HANDLER GET: Halaman Klien
+    // 2. HANDLER GET: Halaman Klien & Ekstraksi Hardware
     // -------------------------------------------------------------
     res.setHeader('Content-Type', 'text/html');
     return res.status(200).send(`
@@ -95,31 +103,29 @@ export default async function handler(req, res) {
     <div class="card" id="app">
         <h3>Memverifikasi Perangkat...</h3>
         <div class="spinner"></div>
-        <p style="color: #64748b; font-size: 14px;">Memeriksa kuota dan validasi perangkat Anda.</p>
+        <p style="color: #64748b; font-size: 14px;">Mengecek identitas perangkat dan kuota klaim.</p>
     </div>
 
     <script>
-        // Fallback jika CDN diblokir AdBlock atau koneksi gagal
-        function getFallbackId() {
-            let localId = localStorage.getItem('device_claim_id');
-            if (!localId) {
-                localId = 'dev_' + Math.random().toString(36).substring(2) + Date.now().toString(36);
-                localStorage.setItem('device_claim_id', localId);
-            }
-            return localId;
-        }
-
-        async function getDeviceFingerprint() {
+        // Ekstraksi data fisik hardware perangkat (identik lintas browser)
+        function getHardwareProfile() {
+            let gpuModel = 'generic_gpu';
             try {
-                // Memuat modul via dynamic import (bebas SyntaxError 'export')
-                const FingerprintJS = await import('https://openfpcdn.io/fingerprintjs/v4');
-                const fp = await FingerprintJS.load();
-                const result = await fp.get();
-                return result.visitorId;
-            } catch (err) {
-                console.warn('Gagal memuat FingerprintJS, beralih ke fallback ID:', err);
-                return getFallbackId();
-            }
+                const canvas = document.createElement('canvas');
+                const gl = canvas.getContext('webgl') || canvas.getContext('experimental-webgl');
+                if (gl) {
+                    const debugInfo = gl.getExtension('WEBGL_debug_renderer_info');
+                    if (debugInfo) {
+                        gpuModel = gl.getParameter(debugInfo.UNMASKED_RENDERER_WEBGL);
+                    }
+                }
+            } catch (e) {}
+
+            return {
+                gpu: gpuModel,
+                screen: screen.width + 'x' + screen.height + '@' + (window.devicePixelRatio || 1),
+                cores: navigator.hardwareConcurrency || 0
+            };
         }
 
         async function runClaim() {
@@ -133,22 +139,16 @@ export default async function handler(req, res) {
             }
 
             try {
-                // 1. Ambil ID unik perangkat
-                const visitorId = await getDeviceFingerprint();
+                const hardwareData = getHardwareProfile();
 
-                // 2. Kirim ke API Vercel
                 const response = await fetch('/api/claim', {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ id: idHadiah, visitorId: visitorId })
+                    body: JSON.stringify({
+                        id: idHadiah,
+                        hardware: hardwareData
+                    })
                 });
-
-                if (!response.ok) {
-                    const errorText = await response.text();
-                    console.error('Server error:', errorText);
-                    container.innerHTML = '<h3 class="error-msg">❌ Terjadi Masalah pada Server</h3><p style="color:#64748b;font-size:13px;">Gagal memproses klaim di database.</p>';
-                    return;
-                }
 
                 const data = await response.json();
 
